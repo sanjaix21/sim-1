@@ -18,7 +18,6 @@ except ImportError:
 
 app = Flask(__name__)
 
-# --- CORS ---
 @app.after_request
 def add_cors_headers(resp):
     resp.headers['Access-Control-Allow-Origin'] = '*'
@@ -26,9 +25,6 @@ def add_cors_headers(resp):
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return resp
 
-# ---------------------------
-# Globals
-# ---------------------------
 connected = set()
 async_loop = None
 collision_count = 0
@@ -47,7 +43,6 @@ def corner_to_coords(corner: str, margin=5):
         return {"x": -(FLOOR_HALF - margin), "y": 0, "z": FLOOR_HALF - margin}
     return {"x": 0, "y": 0, "z": 0}
 
-# Shared state
 agent_state = {
     "last_image_b64": None,
     "goal_reached": False,
@@ -55,9 +50,6 @@ agent_state = {
 }
 image_queue = deque(maxlen=1)
 
-# ---------------------------
-# Enhanced Computer Vision
-# ---------------------------
 class RobotVision:
     def __init__(self):
         self.obstacle_color_range = {
@@ -74,7 +66,6 @@ class RobotVision:
             return {"obstacles": {"center": {"blocked": False}}, "goal": {"visible": False}, "clear_path": {"best_direction": 0}}
         
         try:
-            # Fix: Remove data URL prefix if present
             if ',' in frame_b64:
                 frame_b64 = frame_b64.split(',', 1)[1]
             
@@ -198,14 +189,6 @@ class RobotVision:
             'clearness': sectors[best_direction]
         }
 
-# ---------------------------
-# Smart Navigator (FIXED)
-# ---------------------------
-
-# Replace only the SmartNavigator class in server.py with this fixed version
-
-# Replace only the SmartNavigator class in server.py with this fixed version
-
 class SmartNavigator:
     def __init__(self, host="http://localhost:5000"):
         self.host = host
@@ -231,7 +214,6 @@ class SmartNavigator:
             print(f"Failed to set goal: {e}")
             return
         
-        # Reset tracking variables
         self.last_positions.clear()
         self.consecutive_zero_moves = 0
         self.initial_move_attempted = False
@@ -253,7 +235,6 @@ class SmartNavigator:
         exploration_steps = 0
         last_action_time = 0
         
-        # Check if simulator is responsive via HTTP (don't wait for WebSocket)
         print("Testing simulator connection...")
         try:
             response = requests.post(f"{self.host}/stop", timeout=5)
@@ -265,24 +246,20 @@ class SmartNavigator:
             print(f"WARNING: Could not connect to simulator via HTTP: {e}")
             print("Continuing anyway - simulator might not be ready yet")
         
-        # Brief wait for any initial setup
         print("Starting navigation...")
         time.sleep(1.0)
         
         while self.running and not agent_state["goal_reached"] and step_count < 300:
             step_count += 1
             
-            # Get current robot position
             current_pos = agent_state["robot_position"]
             current_coords = (current_pos['x'], current_pos['z'])
             self.last_positions.append(current_coords)
             
-            # Check if robot is at origin
             if current_pos['x'] == 0 and current_pos['z'] == 0:
                 self.consecutive_zero_moves += 1
                 print(f"Robot still at origin, attempt {self.consecutive_zero_moves}")
                 
-                # If stuck at origin for too long
                 if self.consecutive_zero_moves > 5:
                     if self.consecutive_zero_moves % 2 == 1:
                         print("Trying simple forward movement...")
@@ -291,12 +268,11 @@ class SmartNavigator:
                         print("Trying turn...")
                         self._execute_turn(90)
                     
-                    time.sleep(3.0)  # Longer wait
+                    time.sleep(3.0)
                     continue
             else:
                 self.consecutive_zero_moves = 0
             
-            # Regular stuck detection
             if len(self.last_positions) >= 4 and self.consecutive_zero_moves == 0:
                 if self._positions_clustered(list(self.last_positions)[-4:], threshold=1.0):
                     stuck_counter += 1
@@ -305,21 +281,18 @@ class SmartNavigator:
                         exploration_mode = True
                         exploration_steps = 4
                         stuck_counter = 0
-                        # Try a bigger turn to get unstuck
                         self._execute_turn(int(np.random.choice([90, -90, 135, -135])))
                         time.sleep(2.0)
                         continue
                 else:
                     stuck_counter = max(0, stuck_counter - 1)
 
-            # Capture image (only if WebSocket connected, otherwise skip vision)
             frame_b64 = None
             if len(connected) > 0:
                 print("Requesting image capture...")
                 try:
                     response = requests.post(f"{self.host}/capture", timeout=10)
                     if response.status_code == 200:
-                        # Wait for image
                         frame_b64 = self._wait_for_image(timeout=3.0)
                         if frame_b64:
                             print("Image received and will analyze")
@@ -332,7 +305,6 @@ class SmartNavigator:
             else:
                 print("No WebSocket connection - skipping vision, using position-based navigation")
             
-            # Make decision
             if frame_b64 is not None:
                 try:
                     analysis = self.vision.analyze_frame(frame_b64)
@@ -347,7 +319,6 @@ class SmartNavigator:
                     print(f"Vision analysis failed: {e}")
                     action = self._position_based_action(current_pos)
             else:
-                # Use position-based navigation when no vision available
                 if exploration_mode and exploration_steps > 0:
                     action = self._simple_exploration_action()
                     exploration_steps -= 1
@@ -358,12 +329,10 @@ class SmartNavigator:
             
             print(f"Step {step_count}: Executing {action} at position {current_pos}")
             
-            # Execute action with proper spacing
             current_time = time.time()
             if current_time - last_action_time < 2.0:
                 time.sleep(2.0 - (current_time - last_action_time))
             
-            # Execute the action
             try:
                 if action['type'] == 'turn':
                     self._execute_turn(action['angle'])
@@ -386,9 +355,7 @@ class SmartNavigator:
         print(f"Navigation ended. Steps: {step_count}, Goal reached: {agent_state['goal_reached']}")
     
     def _execute_turn(self, angle):
-        """Execute turn with better error handling and validation"""
         try:
-            # Ensure angle is a valid number
             angle = float(angle)
             data = {"turn": angle, "distance": 0}
             
@@ -413,9 +380,7 @@ class SmartNavigator:
             return False
     
     def _execute_move(self, distance):
-        """Execute move with better error handling and validation"""
         try:
-            # Ensure distance is a valid number
             distance = float(distance)
             data = {"turn": 0, "distance": distance}
             
@@ -440,15 +405,12 @@ class SmartNavigator:
             return False
     
     def _fallback_action(self) -> dict:
-        """Simple fallback action"""
         return {'type': 'move', 'distance': 2.0}
     
     def _goal_directed_action(self, analysis, current_pos) -> dict:
-        """Goal-directed navigation with improved logic"""
         obstacles = analysis['obstacles']
         goal = analysis['goal']
         
-        # Priority 1: Goal visible and close
         if goal['visible'] and goal['distance'] == 'close':
             if not obstacles['center']['blocked']:
                 return {'type': 'move', 'distance': 2.0}
@@ -456,14 +418,12 @@ class SmartNavigator:
                 angle = 20 if goal['direction'] > 0 else -20
                 return {'type': 'turn', 'angle': angle}
         
-        # Priority 2: Goal visible - align and approach
         if goal['visible']:
             if goal['direction'] == 0:
                 if not obstacles['center']['blocked']:
                     distance = 3.0 if goal['distance'] == 'far' else 2.5
                     return {'type': 'move', 'distance': distance}
                 else:
-                    # Obstacle in center, go around
                     if not obstacles['right']['blocked']:
                         return {'type': 'turn', 'angle': 30}
                     elif not obstacles['left']['blocked']:
@@ -471,25 +431,20 @@ class SmartNavigator:
                     else:
                         return {'type': 'turn', 'angle': 90}
             else:
-                # Turn toward goal
                 angle = 25 if goal['direction'] > 0 else -25
                 return {'type': 'turn', 'angle': angle}
         
-        # Priority 3: Navigate toward goal using position
         if self.goal_position:
             dx = self.goal_position['x'] - current_pos['x']
             dz = self.goal_position['z'] - current_pos['z']
             
-            # Calculate desired turn angle
             if abs(dx) > 1.0 or abs(dz) > 1.0:
                 desired_angle = math.degrees(math.atan2(dx, dz))
                 if abs(desired_angle) > 15:
                     turn_angle = max(-60, min(60, desired_angle))
                     return {'type': 'turn', 'angle': turn_angle}
         
-        # Priority 4: Obstacle avoidance
         if obstacles['center']['blocked'] or obstacles['near']['blocked']:
-            # Simple avoidance
             if not obstacles['right']['blocked']:
                 return {'type': 'turn', 'angle': 35}
             elif not obstacles['left']['blocked']:
@@ -497,14 +452,11 @@ class SmartNavigator:
             else:
                 return {'type': 'turn', 'angle': 90}
         
-        # Priority 5: Move forward if path is clear
         return {'type': 'move', 'distance': 3.0}
     
     def _exploration_action(self, analysis) -> dict:
-        """Exploration mode to get unstuck"""
         obstacles = analysis['obstacles']
         
-        # Simple exploration - try to find clear path
         if not obstacles['right']['blocked']:
             return {'type': 'turn_and_move', 'angle': 45, 'distance': 2.5}
         elif not obstacles['left']['blocked']:
@@ -513,7 +465,6 @@ class SmartNavigator:
             return {'type': 'turn', 'angle': int(np.random.choice([120, -120]))}
     
     def _position_based_action(self, current_pos) -> dict:
-        """Navigate using only position information (no vision)"""
         if self.goal_position:
             dx = self.goal_position['x'] - current_pos['x']
             dz = self.goal_position['z'] - current_pos['z']
@@ -521,27 +472,21 @@ class SmartNavigator:
             
             print(f"Distance to goal: {distance_to_goal:.2f}")
             
-            # If very close to goal, just move forward
             if distance_to_goal < 3.0:
                 return {'type': 'move', 'distance': min(distance_to_goal, 2.0)}
             
-            # Calculate desired turn angle
             if abs(dx) > 0.5 or abs(dz) > 0.5:
                 desired_angle = math.degrees(math.atan2(dx, dz))
                 
-                # If we need to turn significantly, just turn
                 if abs(desired_angle) > 20:
                     turn_angle = max(-45, min(45, desired_angle))
                     return {'type': 'turn', 'angle': turn_angle}
                 else:
-                    # Close to correct direction, move forward
                     return {'type': 'move', 'distance': 3.0}
         
-        # Fallback: just move forward
         return {'type': 'move', 'distance': 2.0}
     
     def _simple_exploration_action(self) -> dict:
-        """Simple exploration without vision"""
         angles = [45, -45, 90, -90]
         return {'type': 'turn_and_move', 'angle': int(np.random.choice(angles)), 'distance': 2.0}
     
@@ -554,7 +499,6 @@ class SmartNavigator:
         return None
     
     def _positions_clustered(self, positions, threshold=1.0):
-        """Check if recent positions are clustered (indicating stuck)"""
         if len(positions) < 3:
             return False
         
@@ -565,11 +509,9 @@ class SmartNavigator:
         z_range = max(z_coords) - min(z_coords)
         
         return (x_range + z_range) < threshold
+
 navigator = SmartNavigator()
 
-# ---------------------------
-# WebSocket Handler (FIXED)
-# ---------------------------
 async def ws_handler(websocket, path=None):
     global collision_count
     print("Client connected via WebSocket")
@@ -585,19 +527,18 @@ async def ws_handler(websocket, path=None):
                         print(f"Collision detected! Total: {collision_count}")
                     elif t == "capture_image_response" and data.get("image"):
                         img_b64 = data["image"]
-                        # Fix: Handle data URL format properly
                         if img_b64.startswith("data:"):
                             img_b64 = img_b64.split(",", 1)[-1]
                         agent_state["last_image_b64"] = img_b64
                         image_queue.clear()
                         image_queue.append(img_b64)
-                        print("Image received and queued")  # Debug log
+                        print("Image received and queued")
                         if data.get("position"):
                             agent_state["robot_position"] = data["position"]
                     elif t == "goal_reached":
                         agent_state["goal_reached"] = True
-                        print("🎉 GOAL REACHED!")
-                        navigator.stop()  # Stop navigation when goal is reached
+                        print("GOAL REACHED!")
+                        navigator.stop()
             except Exception as e:
                 print(f"WebSocket message error: {e}")
                 pass
@@ -606,7 +547,7 @@ async def ws_handler(websocket, path=None):
     except Exception as e:
         print(f"WebSocket handler error: {e}")
     finally:
-        connected.discard(websocket)  # Use discard instead of remove to avoid KeyError
+        connected.discard(websocket)
 
 def broadcast(msg: dict):
     if not connected:
@@ -620,15 +561,11 @@ def broadcast(msg: dict):
             print(f"Failed to send to websocket: {e}")
             disconnected.add(ws)
     
-    # Clean up disconnected websockets
     for ws in disconnected:
         connected.discard(ws)
     
     return len(connected) > 0
 
-# ---------------------------
-# Flask Endpoints
-# ---------------------------
 @app.route('/move', methods=['POST'])
 def move():
     data = request.get_json()
@@ -713,13 +650,13 @@ def reset():
 def autonomous_start():
     data = request.get_json() or {}
     corner = data.get("corner", "NE")
-    print(f"🚀 Starting autonomous navigation to {corner}")
+    print(f"Starting autonomous navigation to {corner}")
     navigator.start(corner=corner)
     return jsonify({"status": "autonomous navigation started", "target": corner})
 
 @app.route("/autonomous_stop", methods=["POST"])
 def autonomous_stop():
-    print("🛑 Stopping autonomous navigation")
+    print("Stopping autonomous navigation")
     navigator.stop()
     return jsonify({"status": "autonomous navigation stopped"})
 
@@ -732,33 +669,24 @@ def get_status():
         "robot_position": agent_state.get("robot_position", {"x": 0, "y": 0, "z": 0})
     })
 
-# ---------------------------
-# Flask Thread
-# ---------------------------
 def start_flask():
-    app.run(port=5000, debug=False, use_reloader=False)  # Added use_reloader=False
+    app.run(port=5000, debug=False, use_reloader=False)
 
-# ---------------------------
-# Main Async for WebSocket
-# ---------------------------
 async def main():
     global async_loop
     async_loop = asyncio.get_running_loop()
     try:
         ws_server = await websockets.serve(ws_handler, "localhost", 8080)
-        print("🌐 WebSocket server started on ws://localhost:8080")
+        print("WebSocket server started on ws://localhost:8080")
         await ws_server.wait_closed()
     except Exception as e:
         print(f"WebSocket server error: {e}")
 
-# ---------------------------
-# Entry Point
-# ---------------------------
 if __name__ == "__main__":
-    print("🤖 Robot Navigation Server Starting...")
+    print("Robot Navigation Server Starting...")
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
-    print("🌐 Flask API started on http://localhost:5000")
+    print("Flask API started on http://localhost:5000")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
