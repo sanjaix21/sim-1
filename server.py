@@ -201,6 +201,11 @@ class RobotVision:
 # ---------------------------
 # Smart Navigator (FIXED)
 # ---------------------------
+
+# Replace only the SmartNavigator class in server.py with this fixed version
+
+# Replace only the SmartNavigator class in server.py with this fixed version
+
 class SmartNavigator:
     def __init__(self, host="http://localhost:5000"):
         self.host = host
@@ -208,7 +213,9 @@ class SmartNavigator:
         self.running = False
         self.thread = None
         self.goal_position = None
-        self.last_positions = deque(maxlen=5)  # Track recent positions
+        self.last_positions = deque(maxlen=5)
+        self.consecutive_zero_moves = 0
+        self.initial_move_attempted = False
         
     def start(self, corner="NE"):
         if self.running:
@@ -223,6 +230,11 @@ class SmartNavigator:
         except Exception as e:
             print(f"Failed to set goal: {e}")
             return
+        
+        # Reset tracking variables
+        self.last_positions.clear()
+        self.consecutive_zero_moves = 0
+        self.initial_move_attempted = False
         
         self.thread = threading.Thread(target=self._navigate, daemon=True)
         self.thread.start()
@@ -241,133 +253,223 @@ class SmartNavigator:
         exploration_steps = 0
         last_action_time = 0
         
+        # Check if simulator is responsive via HTTP (don't wait for WebSocket)
+        print("Testing simulator connection...")
+        try:
+            response = requests.post(f"{self.host}/stop", timeout=5)
+            if response.status_code == 200:
+                print("Simulator HTTP connection working")
+            else:
+                print(f"Simulator HTTP test failed: {response.status_code}")
+        except Exception as e:
+            print(f"WARNING: Could not connect to simulator via HTTP: {e}")
+            print("Continuing anyway - simulator might not be ready yet")
+        
+        # Brief wait for any initial setup
+        print("Starting navigation...")
+        time.sleep(1.0)
+        
         while self.running and not agent_state["goal_reached"] and step_count < 300:
             step_count += 1
             
-            # Get current robot position from simulator
+            # Get current robot position
             current_pos = agent_state["robot_position"]
-            self.last_positions.append((current_pos['x'], current_pos['z']))
+            current_coords = (current_pos['x'], current_pos['z'])
+            self.last_positions.append(current_coords)
             
-            # Check if stuck (same position for multiple steps)
-            if len(self.last_positions) >= 3:  # Reduced from 5 to detect stuck faster
-                recent_positions = list(self.last_positions)[-3:]
-                if self._positions_clustered(recent_positions, threshold=0.5):  # Reduced threshold
+            # Check if robot is at origin
+            if current_pos['x'] == 0 and current_pos['z'] == 0:
+                self.consecutive_zero_moves += 1
+                print(f"Robot still at origin, attempt {self.consecutive_zero_moves}")
+                
+                # If stuck at origin for too long
+                if self.consecutive_zero_moves > 5:
+                    if self.consecutive_zero_moves % 2 == 1:
+                        print("Trying simple forward movement...")
+                        self._execute_move(3.0)
+                    else:
+                        print("Trying turn...")
+                        self._execute_turn(90)
+                    
+                    time.sleep(3.0)  # Longer wait
+                    continue
+            else:
+                self.consecutive_zero_moves = 0
+            
+            # Regular stuck detection
+            if len(self.last_positions) >= 4 and self.consecutive_zero_moves == 0:
+                if self._positions_clustered(list(self.last_positions)[-4:], threshold=1.0):
                     stuck_counter += 1
-                    if stuck_counter > 1:  # Reduced from 2 to react faster
-                        print(f"Robot stuck at {current_pos}, entering exploration mode")
+                    if stuck_counter > 3:
+                        print(f"Robot stuck at {current_pos}, trying to unstuck")
                         exploration_mode = True
-                        exploration_steps = 5 + int(np.random.randint(3))  # Shorter exploration
+                        exploration_steps = 4
                         stuck_counter = 0
-                        # Force a different action when stuck
-                        action = {'type': 'turn', 'angle': int(np.random.choice([60, -60, 90, -90]))}
-                        self._execute_turn(action['angle'])
-                        time.sleep(0.8)
+                        # Try a bigger turn to get unstuck
+                        self._execute_turn(int(np.random.choice([90, -90, 135, -135])))
+                        time.sleep(2.0)
                         continue
                 else:
-                    stuck_counter = 0
-                    if not exploration_mode:
-                        exploration_steps = 0
+                    stuck_counter = max(0, stuck_counter - 1)
 
-            # Capture image with better error handling
-            try:
-                response = requests.post(f"{self.host}/capture", timeout=5)
-                if response.status_code != 200:
-                    print(f"Capture request failed: {response.status_code}")
-                    continue
-            except Exception as e:
-                print(f"Capture failed: {e}")
-                continue
-            
-            # Wait for image with longer timeout
-            frame_b64 = self._wait_for_image(timeout=2.0)
-            if frame_b64 is None:
-                print("No image received, using fallback navigation")
-                # Fallback: simple obstacle avoidance without vision
-                action = self._fallback_action()
+            # Capture image (only if WebSocket connected, otherwise skip vision)
+            frame_b64 = None
+            if len(connected) > 0:
+                print("Requesting image capture...")
+                try:
+                    response = requests.post(f"{self.host}/capture", timeout=10)
+                    if response.status_code == 200:
+                        # Wait for image
+                        frame_b64 = self._wait_for_image(timeout=3.0)
+                        if frame_b64:
+                            print("Image received and will analyze")
+                        else:
+                            print("No image received in time")
+                    else:
+                        print(f"Capture request failed: {response.status_code}")
+                except Exception as e:
+                    print(f"Capture failed: {e}")
             else:
-                # Analyze frame
+                print("No WebSocket connection - skipping vision, using position-based navigation")
+            
+            # Make decision
+            if frame_b64 is not None:
                 try:
                     analysis = self.vision.analyze_frame(frame_b64)
+                    if exploration_mode and exploration_steps > 0:
+                        action = self._exploration_action(analysis)
+                        exploration_steps -= 1
+                        if exploration_steps <= 0:
+                            exploration_mode = False
+                    else:
+                        action = self._goal_directed_action(analysis, current_pos)
                 except Exception as e:
                     print(f"Vision analysis failed: {e}")
-                    action = self._fallback_action()
-                    continue
-                
-                # Make decision based on mode
+                    action = self._position_based_action(current_pos)
+            else:
+                # Use position-based navigation when no vision available
                 if exploration_mode and exploration_steps > 0:
-                    action = self._exploration_action(analysis)
+                    action = self._simple_exploration_action()
                     exploration_steps -= 1
                     if exploration_steps <= 0:
                         exploration_mode = False
-                        print("Exploration complete, resuming goal-directed navigation")
                 else:
-                    action = self._goal_directed_action(analysis, current_pos)
+                    action = self._position_based_action(current_pos)
             
-            # Ensure action has minimum distance to actually move the robot
-            if action['type'] == 'move' and action.get('distance', 0) < 1.0:
-                action['distance'] = 1.5
-            elif action['type'] == 'turn_and_move' and action.get('distance', 0) < 1.0:
-                action['distance'] = 1.5
-                
             print(f"Step {step_count}: Executing {action} at position {current_pos}")
             
-            # Execute action with better error handling and timing
+            # Execute action with proper spacing
             current_time = time.time()
-            if current_time - last_action_time < 0.8:  # Ensure minimum time between actions
-                time.sleep(0.8 - (current_time - last_action_time))
-                
+            if current_time - last_action_time < 2.0:
+                time.sleep(2.0 - (current_time - last_action_time))
+            
+            # Execute the action
             try:
                 if action['type'] == 'turn':
                     self._execute_turn(action['angle'])
-                    time.sleep(0.8)
+                    time.sleep(1.5)
                 elif action['type'] == 'move':
                     self._execute_move(action['distance'])
-                    time.sleep(1.0)  # Longer wait for move commands
+                    time.sleep(2.5)
                 elif action['type'] == 'turn_and_move':
                     self._execute_turn(action['angle'])
-                    time.sleep(0.6)
+                    time.sleep(1.2)
                     self._execute_move(action['distance'])
-                    time.sleep(1.0)
+                    time.sleep(2.5)
                 last_action_time = time.time()
+                    
             except Exception as e:
-                print(f"Action execution failed: {e}")
+                print(f"Action execution error: {e}")
             
-            time.sleep(0.2)  # Small delay between steps
+            time.sleep(0.5)
         
         print(f"Navigation ended. Steps: {step_count}, Goal reached: {agent_state['goal_reached']}")
     
+    def _execute_turn(self, angle):
+        """Execute turn with better error handling and validation"""
+        try:
+            # Ensure angle is a valid number
+            angle = float(angle)
+            data = {"turn": angle, "distance": 0}
+            
+            print(f"DEBUG: Sending turn request: {data}")
+            
+            response = requests.post(f"{self.host}/move_rel", 
+                                   json=data, 
+                                   timeout=15,
+                                   headers={'Content-Type': 'application/json'})
+            
+            print(f"DEBUG: Turn response - Status: {response.status_code}, Text: {response.text}")
+            
+            if response.status_code == 200:
+                print(f"Turn {angle}° successful")
+                return True
+            else:
+                print(f"Turn failed: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"Turn request exception: {e}")
+            return False
+    
+    def _execute_move(self, distance):
+        """Execute move with better error handling and validation"""
+        try:
+            # Ensure distance is a valid number
+            distance = float(distance)
+            data = {"turn": 0, "distance": distance}
+            
+            print(f"DEBUG: Sending move request: {data}")
+            
+            response = requests.post(f"{self.host}/move_rel", 
+                                   json=data, 
+                                   timeout=15,
+                                   headers={'Content-Type': 'application/json'})
+            
+            print(f"DEBUG: Move response - Status: {response.status_code}, Text: {response.text}")
+            
+            if response.status_code == 200:
+                print(f"Move {distance} units successful")
+                return True
+            else:
+                print(f"Move failed: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"Move request exception: {e}")
+            return False
+    
     def _fallback_action(self) -> dict:
-        """Simple fallback when vision is not available"""
-        return {'type': 'turn_and_move', 'angle': 45, 'distance': 2.0}  # Increased distance
+        """Simple fallback action"""
+        return {'type': 'move', 'distance': 2.0}
     
     def _goal_directed_action(self, analysis, current_pos) -> dict:
         """Goal-directed navigation with improved logic"""
         obstacles = analysis['obstacles']
         goal = analysis['goal']
-        clear_path = analysis['clear_path']
         
         # Priority 1: Goal visible and close
         if goal['visible'] and goal['distance'] == 'close':
             if not obstacles['center']['blocked']:
-                return {'type': 'move', 'distance': 1.5}
+                return {'type': 'move', 'distance': 2.0}
             elif goal['direction'] != 0:
-                angle = 15 if goal['direction'] > 0 else -15
+                angle = 20 if goal['direction'] > 0 else -20
                 return {'type': 'turn', 'angle': angle}
         
         # Priority 2: Goal visible - align and approach
         if goal['visible']:
             if goal['direction'] == 0:
                 if not obstacles['center']['blocked']:
-                    distance = 3.0 if goal['distance'] == 'far' else 2.0
+                    distance = 3.0 if goal['distance'] == 'far' else 2.5
                     return {'type': 'move', 'distance': distance}
                 else:
-                    # Obstacle in center, try to go around
+                    # Obstacle in center, go around
                     if not obstacles['right']['blocked']:
                         return {'type': 'turn', 'angle': 30}
                     elif not obstacles['left']['blocked']:
                         return {'type': 'turn', 'angle': -30}
                     else:
-                        return {'type': 'turn', 'angle': 60}
+                        return {'type': 'turn', 'angle': 90}
             else:
                 # Turn toward goal
                 angle = 25 if goal['direction'] > 0 else -25
@@ -379,22 +481,14 @@ class SmartNavigator:
             dz = self.goal_position['z'] - current_pos['z']
             
             # Calculate desired turn angle
-            desired_angle = math.degrees(math.atan2(dx, dz))
-            
-            # Check if we need to turn significantly
-            if abs(desired_angle) > 15:
-                turn_angle = max(-45, min(45, desired_angle))
-                if not obstacles['center']['blocked']:
-                    return {'type': 'turn_and_move', 'angle': turn_angle, 'distance': 2.0}
-                else:
+            if abs(dx) > 1.0 or abs(dz) > 1.0:
+                desired_angle = math.degrees(math.atan2(dx, dz))
+                if abs(desired_angle) > 15:
+                    turn_angle = max(-60, min(60, desired_angle))
                     return {'type': 'turn', 'angle': turn_angle}
         
         # Priority 4: Obstacle avoidance
         if obstacles['center']['blocked'] or obstacles['near']['blocked']:
-            if clear_path['clearness'] > 0.7:
-                if abs(clear_path['best_direction']) <= 30:
-                    return {'type': 'turn', 'angle': clear_path['best_direction']}
-            
             # Simple avoidance
             if not obstacles['right']['blocked']:
                 return {'type': 'turn', 'angle': 35}
@@ -404,58 +498,64 @@ class SmartNavigator:
                 return {'type': 'turn', 'angle': 90}
         
         # Priority 5: Move forward if path is clear
-        return {'type': 'move', 'distance': 2.5}
+        return {'type': 'move', 'distance': 3.0}
     
     def _exploration_action(self, analysis) -> dict:
         """Exploration mode to get unstuck"""
         obstacles = analysis['obstacles']
-        clear_path = analysis['clear_path']
         
-        # Try to find a clear direction
-        if clear_path['clearness'] > 0.8:
-            angle = clear_path['best_direction']
-            if abs(angle) > 20:
-                return {'type': 'turn', 'angle': angle}
-            else:
-                return {'type': 'move', 'distance': 2.0}
-        
-        # Random exploration
+        # Simple exploration - try to find clear path
         if not obstacles['right']['blocked']:
-            return {'type': 'turn_and_move', 'angle': int(np.random.randint(20, 60)), 'distance': 2.0}
+            return {'type': 'turn_and_move', 'angle': 45, 'distance': 2.5}
         elif not obstacles['left']['blocked']:
-            return {'type': 'turn_and_move', 'angle': int(np.random.randint(-60, -20)), 'distance': 2.0}
+            return {'type': 'turn_and_move', 'angle': -45, 'distance': 2.5}
         else:
-            return {'type': 'turn', 'angle': int(np.random.choice([90, -90, 120, -120]))}
+            return {'type': 'turn', 'angle': int(np.random.choice([120, -120]))}
     
-    def _wait_for_image(self, timeout=3.0):  # Increased default timeout
+    def _position_based_action(self, current_pos) -> dict:
+        """Navigate using only position information (no vision)"""
+        if self.goal_position:
+            dx = self.goal_position['x'] - current_pos['x']
+            dz = self.goal_position['z'] - current_pos['z']
+            distance_to_goal = math.sqrt(dx*dx + dz*dz)
+            
+            print(f"Distance to goal: {distance_to_goal:.2f}")
+            
+            # If very close to goal, just move forward
+            if distance_to_goal < 3.0:
+                return {'type': 'move', 'distance': min(distance_to_goal, 2.0)}
+            
+            # Calculate desired turn angle
+            if abs(dx) > 0.5 or abs(dz) > 0.5:
+                desired_angle = math.degrees(math.atan2(dx, dz))
+                
+                # If we need to turn significantly, just turn
+                if abs(desired_angle) > 20:
+                    turn_angle = max(-45, min(45, desired_angle))
+                    return {'type': 'turn', 'angle': turn_angle}
+                else:
+                    # Close to correct direction, move forward
+                    return {'type': 'move', 'distance': 3.0}
+        
+        # Fallback: just move forward
+        return {'type': 'move', 'distance': 2.0}
+    
+    def _simple_exploration_action(self) -> dict:
+        """Simple exploration without vision"""
+        angles = [45, -45, 90, -90]
+        return {'type': 'turn_and_move', 'angle': int(np.random.choice(angles)), 'distance': 2.0}
+    
+    def _wait_for_image(self, timeout=4.0):
         start_time = time.time()
         while time.time() - start_time < timeout:
             if image_queue:
                 return image_queue[-1]
-            time.sleep(0.1)  # Slightly longer sleep
+            time.sleep(0.2)
         return None
     
-    def _execute_turn(self, angle):
-        try:
-            response = requests.post(f"{self.host}/move_rel", 
-                         json={"turn": int(angle), "distance": 0}, timeout=5)
-            if response.status_code != 200:
-                print(f"Turn request failed: {response.status_code}")
-        except Exception as e:
-            print(f"Turn failed: {e}")
-    
-    def _execute_move(self, distance):
-        try:
-            response = requests.post(f"{self.host}/move_rel", 
-                         json={"turn": 0, "distance": float(distance)}, timeout=5)
-            if response.status_code != 200:
-                print(f"Move request failed: {response.status_code}")
-        except Exception as e:
-            print(f"Move failed: {e}")
-    
-    def _positions_clustered(self, positions, threshold=0.5):  # Reduced threshold
+    def _positions_clustered(self, positions, threshold=1.0):
         """Check if recent positions are clustered (indicating stuck)"""
-        if len(positions) < 2:  # Reduced minimum positions needed
+        if len(positions) < 3:
             return False
         
         x_coords = [p[0] for p in positions]
@@ -465,7 +565,6 @@ class SmartNavigator:
         z_range = max(z_coords) - min(z_coords)
         
         return (x_range + z_range) < threshold
-
 navigator = SmartNavigator()
 
 # ---------------------------
